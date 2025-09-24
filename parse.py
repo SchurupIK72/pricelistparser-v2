@@ -38,8 +38,28 @@ def normalize_article(article: str) -> str:
 def get_article_core(article: str) -> str:
     if not isinstance(article, str):
         return ""
+    # Нормализуем регистр и нестандартные разделители, убираем типовые хвостовые суффиксы
     article = article.upper()
-    article = re.sub(r"(-СПЕЦМАШ|-РК|-СБ|-В2|-01|-02|-03|-10-Р|-Р)$", "", article)
+    # нормализуем дефисы и NBSP, как в extract_articles
+    hyphens = "\u2010\u2011\u2012\u2013\u2014\u2212"  # ‐ ‑ ‒ – — −
+    trans = {ord(c): "-" for c in hyphens}
+    trans[0xA0] = " "  # NBSP -> space
+    article = article.translate(trans)
+
+    # Многократно срезаем типовые текстовые хвосты (СПЕЦМАШ/РК/СБ/Р/ВN) и затем короткие числовые вариации (-01/-10 и т.п.)
+    # Сначала текстовые суффиксы
+    while True:
+        new_article = re.sub(r"(?:-(?:СПЕЦМАШ|РК|СБ|Р|В\d+))$", "", article)
+        if new_article == article:
+            break
+        article = new_article
+    # Затем одно- до трёхзначные числовые суффиксы (в т.ч. варианты -10Р, -01А)
+    while True:
+        new_article = re.sub(r"-\d{1,3}[A-ZА-Я]?$", "", article)
+        if new_article == article:
+            break
+        article = new_article
+
     tokens = re.findall(r"[A-ZА-Я0-9]+", article)
     tokens = sorted(tokens)
     return "".join(tokens)
@@ -63,17 +83,12 @@ def extract_articles(text: str):
         return []
     text = text.upper()
     # Нормализуем дефисы (– — ‑ − …) и неразрывные пробелы
-    def _normalize_separators(s: str) -> str:
-        if not isinstance(s, str):
-            return ""
-        hyphens = "\u2010\u2011\u2012\u2013\u2014\u2212"  # ‐ ‑ ‒ – — −
-        trans = {ord(c): "-" for c in hyphens}
-        trans[0xA0] = ord(" ")  # NBSP -> space
-        return s.translate(trans)
-
-    text = _normalize_separators(text)
-    # Ищем группы из букв/цифр/дефисов длиной >=4
-    candidates = re.findall(r"[A-ZА-Я0-9\-]{4,}", text)
+    hyphens = "\u2010\u2011\u2012\u2013\u2014\u2212"  # ‐ ‑ ‒ – — −
+    trans = {ord(c): "-" for c in hyphens}
+    trans[0xA0] = ord(" ")  # NBSP -> space
+    text = text.translate(trans)
+    # Ищем группы из букв/цифр/дефисов/точек/слэшей длиной >=4
+    candidates = re.findall(r"[A-ZА-Я0-9\-\./]{4,}", text)
     return candidates
 
 
@@ -121,6 +136,34 @@ def find_header_row_strict(
         if exact_count >= min_matches:
             return i
     return -1
+
+
+def promote_header_if_found(df: pd.DataFrame, search_terms=("Артикул", "Код", "Номер", "Товар")) -> pd.DataFrame:
+    """Если DataFrame прочитан без заголовков, попробуем найти строку-заголовок внутри первых ~60 строк
+    и поднять её в columns. Возвращает обновлённый DataFrame (или исходный, если не найдено).
+    """
+    try:
+        max_rows = min(len(df), 60)
+        terms = [t.lower() for t in search_terms]
+        for i in range(max_rows):
+            row_values = (
+                df.iloc[i]
+                .astype(str)
+                .str.replace("\n", " ")
+                .str.strip()
+                .str.lower()
+                .tolist()
+            )
+            # ищем точное вхождение хотя бы одного из терминов
+            if any(t in row_values for t in terms):
+                # поднимаем строку i как заголовки
+                new_cols = df.iloc[i].astype(str).str.strip().tolist()
+                df2 = df.iloc[i + 1 :].copy()
+                df2.columns = new_cols
+                return df2
+    except Exception:
+        pass
+    return df
 
 
 def main_process(
@@ -177,28 +220,50 @@ def main_process(
 
     client_header = find_header_row(client_path)
     client_df = pd.read_excel(
-        client_path, engine=smart_engine(client_path), header=client_header
+        client_path,
+        engine=smart_engine(client_path),
+        header=(client_header if client_header is not None and client_header >= 0 else None),
     )
+    if client_header is None or client_header < 0:
+        client_df = promote_header_if_found(
+            client_df, search_terms=("Артикул", "Код", "Номер", "Товар")
+        )
 
     # Для номенклатуры ищем строгую строку заголовка, чтобы не спутать с содержимым
     nom_header = find_header_row_strict(
         nom_path, search_terms=("Номенклатура", "Артикул", "Цена"), min_matches=2
     )
+    if nom_header is None or nom_header < 0:
+        # fallback: мягкий поиск
+        nom_header = find_header_row(nom_path, search_terms=("Артикул", "Номенклатура", "Цена"))
     nomenclature_df = pd.read_excel(
-        nom_path, engine=smart_engine(nom_path), header=nom_header
+        nom_path,
+        engine=smart_engine(nom_path),
+        header=(nom_header if nom_header is not None and nom_header >= 0 else None),
     )
+    if nom_header is None or nom_header < 0:
+        nomenclature_df = promote_header_if_found(
+            nomenclature_df, search_terms=("Номенклатура", "Артикул", "Цена")
+        )
     nomenclature_df.rename(columns=lambda c: str(c).strip(), inplace=True)
 
     if "Артикул" not in nomenclature_df.columns:
         raise RuntimeError("Не найдена колонка 'Артикул' в номенклатуре")
 
     nomenclature_df["Нормализованный артикул"] = nomenclature_df["Артикул"].apply(normalize_article)
+    nomenclature_df["Базовое ядро"] = nomenclature_df["Артикул"].apply(get_article_core)
     nomenclature_articles = nomenclature_df["Нормализованный артикул"].tolist()
     # Карта для мгновенного точного совпадения по нормализованному артикулу
     norm_to_index = {}
     for idx, val in enumerate(nomenclature_articles):
         # Если дубль, оставим первый — поведение можно расширить при необходимости
         norm_to_index.setdefault(val, idx)
+
+    # Карта базового ядра -> индекс (первый встретившийся). Нужна для сопоставления
+    # "64221-3502111" с "64221-3502111-10-СПЕЦМАШ" на 100%.
+    base_core_to_index = {}
+    for idx, core in enumerate(nomenclature_df["Базовое ядро"].tolist()):
+        base_core_to_index.setdefault(core, idx)
 
     client_article_cols = [
         col
@@ -269,23 +334,33 @@ def main_process(
                 best_row, best_score = nomenclature_df.iloc[exact_idx], 100
                 priority = (2, 100, len(norm_art))  # 2 — highest tier
             else:
+                # 1b) Точное совпадение по базовому ядру (без вариантных суффиксов)
+                if client_core:
+                    base_idx = base_core_to_index.get(client_core)
+                    if base_idx is not None:
+                        best_row, best_score = nomenclature_df.iloc[base_idx], 100
+                        priority = (2, 100, len(norm_art))
+                    else:
+                        priority = (0, 0, 0)
+                else:
+                    priority = (0, 0, 0)
                 # 2) Приоритет по одинаковому числовому ядру + сравнение по названию
-                nc = extract_numeric_core(art)
-                priority = (0, 0, 0)
-                if nc and nc in num_core_to_indices:
-                    name_best = -1
-                    name_best_row = None
-                    for idx in num_core_to_indices[nc]:
-                        nom_row = nomenclature_df.iloc[idx]
-                        name_val = str(nom_row.get(nom_name_col, "")) if nom_name_col else ""
-                        name_score = fuzz.WRatio(raw_join_upper, name_val.upper()) if name_val else 0
-                        if name_score > name_best:
-                            name_best = name_score
-                            name_best_row = nom_row
-                    if name_best_row is not None:
-                        best_row = name_best_row
-                        best_score = name_best  # используем как общую уверенность
-                        priority = (1, name_best, len(norm_art))  # 1 — mid tier
+                if best_row is None:  # не сработали точные
+                    nc = extract_numeric_core(art)
+                    if nc and nc in num_core_to_indices:
+                        name_best = -1
+                        name_best_row = None
+                        for idx in num_core_to_indices[nc]:
+                            nom_row = nomenclature_df.iloc[idx]
+                            name_val = str(nom_row.get(nom_name_col, "")) if nom_name_col else ""
+                            name_score = fuzz.WRatio(raw_join_upper, name_val.upper()) if name_val else 0
+                            if name_score > name_best:
+                                name_best = name_score
+                                name_best_row = nom_row
+                        if name_best_row is not None:
+                            best_row = name_best_row
+                            best_score = name_best  # используем как общую уверенность
+                            priority = (1, name_best, len(norm_art))  # 1 — mid tier
 
                 # 3) Общий fuzzy-поиск по нормализованным артикулам (если ещё не выбрали)
                 if best_row is None:
