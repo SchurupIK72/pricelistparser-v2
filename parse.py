@@ -373,31 +373,31 @@ def main_process(
                 else:
                     priority = (0, 0, 0)
 
-                # 1c) Расширенный вариант: числовые токены клиента ⊆ токенов номенклатуры
-                # Например: клиент 009, номенклатура 009-013 => предпочтём комплект
-                if best_row is None and client_sig in letter_sig_to_indices and client_nums:
+                # 1c) Расширенный вариант/комплект: числовые токены клиента ⊆ токенов номенклатуры.
+                # Кандидатов берём по самому длинному числовому ядру (ускорение и точность семейства).
+                if best_row is None and client_nums:
                     cand_best = None
                     cand_best_score = -1
-                    for idx in letter_sig_to_indices.get(client_sig, []):
+                    cand_best_extra = -1
+                    nc_long = extract_numeric_core(art)
+                    candidate_idxs = num_core_to_indices.get(nc_long, []) if nc_long else []
+                    for idx in candidate_idxs:
                         nom_row = nomenclature_df.iloc[idx]
-                        nom_nums = set(nom_row["NUM_TOKENS"]) if isinstance(nom_row["NUM_TOKENS"], list) else set()
+                        nom_nums_list = nom_row["NUM_TOKENS"] if isinstance(nom_row.get("NUM_TOKENS"), list) else []
+                        nom_nums = set(nom_nums_list)
                         if set(client_nums).issubset(nom_nums) and len(nom_nums) >= len(client_nums):
-                            # Больше дополнительных номеров — чуть ниже базовый балл
                             extra = len(nom_nums) - len(client_nums)
                             base = 95 - max(0, extra - 1) * 5
-                            # Если в описании есть "КОМПЛ" — считаем как 100%
                             score_here = 100 if ("КОМПЛ" in raw_join_upper) else base
-                            if score_here > cand_best_score:
+                            # предпочитаем более "полные" комплекты (больше extra) при равном score
+                            if (score_here > cand_best_score) or (score_here == cand_best_score and extra > cand_best_extra):
                                 cand_best = nom_row
                                 cand_best_score = score_here
+                                cand_best_extra = extra
                     if cand_best is not None:
                         best_row = cand_best
                         best_score = cand_best_score
-                        # При 100% (комплект) поднимем в старший приоритет
-                        if best_score >= 100:
-                            priority = (2, best_score, len(norm_art))
-                        else:
-                            priority = (1, best_score, len(norm_art))
+                        priority = (2 if best_score >= 100 else 1, best_score, len(norm_art))
                 # 2) Приоритет по одинаковому числовому ядру + сравнение по названию
                 if best_row is None:  # не сработали точные
                     nc = extract_numeric_core(art)
