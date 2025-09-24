@@ -54,11 +54,14 @@ def get_article_core(article: str) -> str:
             break
         article = new_article
     # Затем одно- до трёхзначные числовые суффиксы (в т.ч. варианты -10Р, -01А)
-    while True:
-        new_article = re.sub(r"-\d{1,3}[A-ZА-Я]?$", "", article)
-        if new_article == article:
-            break
-        article = new_article
+    # ВАЖНО: для "точечных" конструкторских кодов (есть точки внутри, например У.036.57.000-02)
+    # суффикс -02 является частью базового артикула, поэтому его не срезаем.
+    if "." not in article:
+        while True:
+            new_article = re.sub(r"-\d{1,3}[A-ZА-Я]?$", "", article)
+            if new_article == article:
+                break
+            article = new_article
 
     tokens = re.findall(r"[A-ZА-Я0-9]+", article)
     tokens = sorted(tokens)
@@ -252,6 +255,24 @@ def main_process(
 
     nomenclature_df["Нормализованный артикул"] = nomenclature_df["Артикул"].apply(normalize_article)
     nomenclature_df["Базовое ядро"] = nomenclature_df["Артикул"].apply(get_article_core)
+    # Доп. признаки для сопоставления комплектов: буквенная сигнатура и набор числовых токенов
+    def _letter_sig(s: str) -> str:
+        if not isinstance(s, str):
+            return ""
+        s = s.upper()
+        hyphens = "\u2010\u2011\u2012\u2013\u2014\u2212"
+        trans = {ord(c): "-" for c in hyphens}
+        trans[0xA0] = " "
+        s = s.translate(trans)
+        return "".join(sorted(re.findall(r"[A-ZА-Я]+", s)))
+
+    def _num_tokens(s: str):
+        if not isinstance(s, str):
+            return []
+        return re.findall(r"\d+", s.upper())
+
+    nomenclature_df["LETTER_SIG"] = nomenclature_df["Артикул"].apply(_letter_sig)
+    nomenclature_df["NUM_TOKENS"] = nomenclature_df["Артикул"].apply(_num_tokens)
     nomenclature_articles = nomenclature_df["Нормализованный артикул"].tolist()
     # Карта для мгновенного точного совпадения по нормализованному артикулу
     norm_to_index = {}
@@ -264,6 +285,11 @@ def main_process(
     base_core_to_index = {}
     for idx, core in enumerate(nomenclature_df["Базовое ядро"].tolist()):
         base_core_to_index.setdefault(core, idx)
+
+    # Индекс по буквенной сигнатуре -> индексы
+    letter_sig_to_indices = {}
+    for idx, sig in enumerate(nomenclature_df["LETTER_SIG"].tolist()):
+        letter_sig_to_indices.setdefault(sig, []).append(idx)
 
     client_article_cols = [
         col
@@ -327,6 +353,8 @@ def main_process(
             client_core = get_article_core(art)
             best_row = None
             best_score = -1
+            client_sig = "".join(sorted(re.findall(r"[A-ZА-Я]+", art.upper())))
+            client_nums = re.findall(r"\d+", art.upper())
 
             # 1) Точное совпадение по нормализованному артикулу
             exact_idx = norm_to_index.get(norm_art)
@@ -344,6 +372,32 @@ def main_process(
                         priority = (0, 0, 0)
                 else:
                     priority = (0, 0, 0)
+
+                # 1c) Расширенный вариант: числовые токены клиента ⊆ токенов номенклатуры
+                # Например: клиент 009, номенклатура 009-013 => предпочтём комплект
+                if best_row is None and client_sig in letter_sig_to_indices and client_nums:
+                    cand_best = None
+                    cand_best_score = -1
+                    for idx in letter_sig_to_indices.get(client_sig, []):
+                        nom_row = nomenclature_df.iloc[idx]
+                        nom_nums = set(nom_row["NUM_TOKENS"]) if isinstance(nom_row["NUM_TOKENS"], list) else set()
+                        if set(client_nums).issubset(nom_nums) and len(nom_nums) >= len(client_nums):
+                            # Больше дополнительных номеров — чуть ниже базовый балл
+                            extra = len(nom_nums) - len(client_nums)
+                            base = 95 - max(0, extra - 1) * 5
+                            # Если в описании есть "КОМПЛ" — считаем как 100%
+                            score_here = 100 if ("КОМПЛ" in raw_join_upper) else base
+                            if score_here > cand_best_score:
+                                cand_best = nom_row
+                                cand_best_score = score_here
+                    if cand_best is not None:
+                        best_row = cand_best
+                        best_score = cand_best_score
+                        # При 100% (комплект) поднимем в старший приоритет
+                        if best_score >= 100:
+                            priority = (2, best_score, len(norm_art))
+                        else:
+                            priority = (1, best_score, len(norm_art))
                 # 2) Приоритет по одинаковому числовому ядру + сравнение по названию
                 if best_row is None:  # не сработали точные
                     nc = extract_numeric_core(art)
