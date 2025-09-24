@@ -95,6 +95,15 @@ def extract_articles(text: str):
     return candidates
 
 
+# Определение триггеров для комплектов/наборов в тексте
+KIT_TRIGGERS_RE = re.compile(r"\b(КОМПЛЕКТ|КОМПЛ\.?|НАБОР|НАБ\.)\b", re.IGNORECASE)
+
+def has_kit_trigger(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    return KIT_TRIGGERS_RE.search(text) is not None
+
+
 def find_header_row(path: str, sheet_name=0, search_terms=("Артикул", "Код", "Номер", "Товар")) -> int:
     preview = pd.read_excel(
         path, sheet_name=sheet_name, header=None, nrows=60, engine=smart_engine(path)
@@ -388,7 +397,7 @@ def main_process(
                         if set(client_nums).issubset(nom_nums) and len(nom_nums) >= len(client_nums):
                             extra = len(nom_nums) - len(client_nums)
                             base = 95 - max(0, extra - 1) * 5
-                            score_here = 100 if ("КОМПЛ" in raw_join_upper) else base
+                            score_here = 100 if has_kit_trigger(raw_join_upper) else base
                             # предпочитаем более "полные" комплекты (больше extra) при равном score
                             if (score_here > cand_best_score) or (score_here == cand_best_score and extra > cand_best_extra):
                                 cand_best = nom_row
