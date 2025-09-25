@@ -4,6 +4,11 @@ import re
 import os
 
 DEFAULT_MIN_MATCH_SCORE = 65  # минимальный процент совпадения по умолчанию
+FILTER_NUMERIC_NOISE = True   # включить фильтрацию числового шума (цены, количества)
+AUTO_FIX_MOJIBAKE = True      # попытаться починить кракозябры cp1251->latin1
+DIAG_COLLECT_UNMATCHED = True # собирать диагностическую информацию по непросопоставленным строкам
+# Брендовые / служебные слова, которые не должны побеждать в выборе артикула, если есть более "артикульные" токены
+STOPWORD_BRANDS = {"СПЕЦМАШ", "СПЕЦМAШ", "СПЕЦ", "ЕВРО", "ЕВРО4"}
 OUTPUT_COLUMNS = [
     "Исходные тексты",
     "Извлеченный артикул",
@@ -24,6 +29,39 @@ def smart_engine(path: str) -> str:
     if ext == ".xls":
         return "xlrd"
     return "openpyxl"
+
+
+# Надстройка над pandas.read_excel для старых .xls без CODEPAGE.
+# xlrd при отсутствии CODEPAGE падает в iso-8859-1 -> возникают кракозябры.
+# Пробуем: обычное чтение -> если мало кириллицы, пробуем побайтно перекодировать ячейки.
+def read_legacy_xls(path, **kwargs):
+    df = pd.read_excel(path, **kwargs)
+    # Быстрая эвристика: если файл .xls и практически нет кириллицы, попробуем перебор перекодирования.
+    if os.path.splitext(path.lower())[1] == '.xls':
+        sample = " ".join(df.astype(str).head(20).fillna("").values.flatten())
+        cyr = len(re.findall(r"[А-Яа-я]", sample))
+        # Если кириллицы <1% символов, а есть много символов 'Ð'/'Ñ', пробуем восстановить
+        if cyr < 5 and re.search(r"[ÐÑÃÂ]", sample):
+            def fix_cell(v):
+                if not isinstance(v, str):
+                    return v
+                if re.search(r"[А-Яа-я]", v):
+                    return v
+                try:
+                    b = v.encode('latin-1', errors='ignore')
+                    cand = b.decode('utf-8', errors='ignore')
+                    if re.search(r"[А-Яа-я]", cand):
+                        return cand
+                    # Вторая попытка cp1251
+                    cand2 = b.decode('cp1251', errors='ignore')
+                    if re.search(r"[А-Яа-я]", cand2):
+                        return cand2
+                except Exception:
+                    return v
+                return v
+            for col in df.columns:
+                df[col] = df[col].apply(fix_cell)
+    return df
 
 
 def normalize_article(article: str) -> str:
@@ -90,8 +128,12 @@ def extract_articles(text: str):
     trans = {ord(c): "-" for c in hyphens}
     trans[0xA0] = ord(" ")  # NBSP -> space
     text = text.translate(trans)
-    # Ищем группы из букв/цифр/дефисов/точек/слэшей длиной >=4
-    candidates = re.findall(r"[A-ZА-Я0-9\-\./]{4,}", text)
+    # Ищем группы из букв/цифр/дефисов/точек/слэшей
+    # Минимум 3 символа, чтобы ловить короткие конструкции типа "6ММ".
+    # Чтобы не тащить мусор (например, трёхбуквенные слова без цифр),
+    # оставляем либо токены с цифрой, либо длиной >= 4.
+    raw = re.findall(r"[A-ZА-Я0-9\-\./]{3,}", text)
+    candidates = [t for t in raw if any(ch.isdigit() for ch in t) or len(t) >= 4]
     return candidates
 
 
@@ -104,8 +146,121 @@ def has_kit_trigger(text: str) -> bool:
     return KIT_TRIGGERS_RE.search(text) is not None
 
 
+# Универсальная очистка значения ячейки: приводим к строке, убираем лишнее,
+# чиним типичные случаи Excel, когда артикул считался числом (float с .0 / экспонента)
+def _clean_cell_value(val):
+    if pd.isna(val):
+        return ""
+    # Если float без десятичной части -> целое
+    if isinstance(val, float):
+        if val.is_integer():
+            return str(int(val))
+        # Замена запятой на точку для единообразия
+        return str(val).replace(",", ".")
+    # Если int
+    if isinstance(val, int):
+        return str(val)
+    s = str(val).strip()
+    # Удаляем конечное .0 если это артикул в текстовом виде
+    if re.fullmatch(r"[0-9]+\.0", s):
+        return s[:-2]
+    # На всякий случай защищаемся от экспоненциальной формы (1.23457E+11)
+    if re.fullmatch(r"[0-9]+\.[0-9]+E\+[0-9]+", s.upper()):
+        try:
+            num = float(s)
+            # Форматируем без экспоненты, без потери целых
+            if num.is_integer():
+                return str(int(num))
+            return ("%.0f" % num)
+        except Exception:
+            return s
+    return s
+
+
+# Попытка восстановить кириллицу, если текст выглядит как кракозябры
+# Признак: много символов из диапазона латиницы с диакритикой, совокупность 'Ã', 'Ð', 'Ñ', 'Â', 'Ò', 'Ê'
+# которые часто появляются при интерпретации UTF-8 как cp1251 или наоборот.
+def maybe_fix_mojibake(s: str) -> str:
+    if not isinstance(s, str) or not s:
+        return s
+    # Быстрый фильтр: если уже есть достаточное количество кириллицы, не трогаем
+    if re.search(r"[А-Яа-я]", s):
+        return s
+    # Считаем число латинских "подозрительных" символов
+    suspect = len(re.findall(r"[ÃÂÐÑÒÕÊ]+", s))
+
+    # Доп. эвристика для классического варианта cp1251->latin1: присутствуют символы
+    # из диапазона 0xC0-0xFF (Ô, ë, à, í, µ, ö ...) но нет кириллицы и нет ASCII слов.
+    if suspect == 0:
+        high_range = sum(1 for ch in s if ord(ch) >= 0xC0)
+        letters = sum(1 for ch in s if ch.isalpha())
+        if letters and high_range / max(letters,1) >= 0.3:  # порог 30%
+            suspect = high_range  # форсируем попытки восстановления
+    if suspect == 0:
+        return s
+
+    candidates = []
+    def score(txt: str) -> float:
+        if not txt:
+            return 0.0
+        total = len(txt)
+        cyr = len(re.findall(r"[А-Яа-я]", txt))
+        # штраф за control / replacement
+        bad = len(re.findall(r"[\ufffd]", txt))
+        return (cyr - bad * 2) / max(total,1)
+
+    try:
+        b_latin = s.encode('latin-1', errors='ignore')
+    except Exception:
+        b_latin = b""
+
+    # Стратегии:
+    # 1. latin1 bytes -> utf-8
+    try:
+        cand1 = b_latin.decode('utf-8', errors='ignore')
+        candidates.append(cand1)
+    except Exception:
+        pass
+    # 2. latin1 bytes -> cp1251
+    try:
+        cand2 = b_latin.decode('cp1251', errors='ignore')
+        candidates.append(cand2)
+    except Exception:
+        pass
+    # 3. Попытка двойного раскодирования: исходная строка могла получиться из UTF-8 -> cp1251 -> latin1
+    try:
+        # трактуем исходную строку как cp1251 уже раскодированную посимвольно из utf-8
+        b_cp = s.encode('cp1251', errors='ignore')
+        cand3 = b_cp.decode('utf-8', errors='ignore')
+        candidates.append(cand3)
+    except Exception:
+        pass
+    # 4. Попробовать повторно пропустить cand1 через тот же цикл (иногда два слоя)
+    more = []
+    for c in list(candidates):
+        if c and not re.search(r"[А-Яа-я]", c):
+            try:
+                more.append(c.encode('latin-1', errors='ignore').decode('utf-8', errors='ignore'))
+            except Exception:
+                pass
+    candidates.extend(more)
+
+    # Оцениваем и выбираем лучшего
+    best = s
+    best_score = -1
+    for c in candidates:
+        sc = score(c)
+        if sc > best_score and re.search(r"[А-Яа-я]", c):
+            best_score = sc
+            best = c
+    # Требуем хотя бы немного кириллицы
+    if best is not s and best_score > 0:
+        return best
+    return s
+
+
 def find_header_row(path: str, sheet_name=0, search_terms=("Артикул", "Код", "Номер", "Товар")) -> int:
-    preview = pd.read_excel(
+    preview = read_legacy_xls(
         path, sheet_name=sheet_name, header=None, nrows=60, engine=smart_engine(path)
     )
     for i in range(len(preview)):
@@ -131,7 +286,7 @@ def find_header_row_strict(
     min_matches: int = 2,
     preview_rows: int = 80,
 ):
-    preview = pd.read_excel(
+    preview = read_legacy_xls(
         path, sheet_name=sheet_name, header=None, nrows=preview_rows, engine=smart_engine(path)
     )
     terms_lower = [t.lower() for t in search_terms]
@@ -231,7 +386,7 @@ def main_process(
     print(f"[INFO] Порог совпадения: {min_score}")
 
     client_header = find_header_row(client_path)
-    client_df = pd.read_excel(
+    client_df = read_legacy_xls(
         client_path,
         engine=smart_engine(client_path),
         header=(client_header if client_header is not None and client_header >= 0 else None),
@@ -248,7 +403,7 @@ def main_process(
     if nom_header is None or nom_header < 0:
         # fallback: мягкий поиск
         nom_header = find_header_row(nom_path, search_terms=("Артикул", "Номенклатура", "Цена"))
-    nomenclature_df = pd.read_excel(
+    nomenclature_df = read_legacy_xls(
         nom_path,
         engine=smart_engine(nom_path),
         header=(nom_header if nom_header is not None and nom_header >= 0 else None),
@@ -283,6 +438,15 @@ def main_process(
     nomenclature_df["LETTER_SIG"] = nomenclature_df["Артикул"].apply(_letter_sig)
     nomenclature_df["NUM_TOKENS"] = nomenclature_df["Артикул"].apply(_num_tokens)
     nomenclature_articles = nomenclature_df["Нормализованный артикул"].tolist()
+    # Множество чисто цифровых нормализованных артикулов из номенклатуры (редко, но бывают)
+    digit_only_norms = {a for a in nomenclature_articles if a.isdigit()}
+    # Карта склеенных цифр (удаляем всё нецифровое) -> индекс. Нужна, чтобы сопоставлять варианты
+    # вида 5340-1308110 и 53401308110 как идентичные.
+    digits_collapse_to_index = {}
+    for idx, art in enumerate(nomenclature_df["Артикул"].astype(str)):
+        collapsed = re.sub(r"\D", "", art)
+        if len(collapsed) >= 8:  # только достаточно длинные, чтобы не путать с количеством
+            digits_collapse_to_index.setdefault(collapsed, idx)
     # Карта для мгновенного точного совпадения по нормализованному артикулу
     norm_to_index = {}
     for idx, val in enumerate(nomenclature_articles):
@@ -321,6 +485,12 @@ def main_process(
         if any(k in str(col).lower() for k in ["цена", "стоим", "price", "руб", "cost", "amount"])
     ]
 
+    # Если не нашли ни одного столбца артикула/описания — делаем мягкий фолбэк:
+    # считаем, что ВСЕ текстовые столбцы могут содержать полезные данные.
+    if not client_article_cols and not description_cols:
+        print("[WARN] Не удалось распознать заголовки с артикулами/описанием. Включён резервный режим: все столбцы будут участвовать в разборе.")
+        description_cols = client_df.columns.tolist()
+
     # Попробуем найти название товара и цену в номенклатуре
     nom_name_col = None
     nom_price_col = None
@@ -342,17 +512,76 @@ def main_process(
 
     results = []
 
+    def token_quality(tok: str) -> int:
+        """Эвристический приоритет "артикульности" токена.
+        Более высокий => предпочтительнее при одинаковом результате сопоставления.
+        Критерии:
+          5: длинная (>=8) последовательность цифр +/- разделители (похоже на артикул/код)
+          4: содержит >=5 цифр или смесь цифр и букв длиной >=5
+          3: содержит цифры, длина >=3
+          1: чисто буквы длиной >=4 (общие слова)
+          0: бренд / стоп-слово
+        """
+        if not tok:
+            return -1
+        up = tok.upper()
+        letters = re.sub(r"[^A-ZА-Я]", "", up)
+        digits = re.sub(r"\D", "", up)
+        if up in STOPWORD_BRANDS:
+            return 0
+        if len(digits) >= 8:
+            return 5
+        if (letters and digits and len(up) >= 5) or len(digits) >= 5:
+            return 4
+        if digits:
+            return 3
+        if len(letters) >= 4:
+            return 1
+        return 0
+
     for _, row in client_df.iterrows():
+        unmatched_reason = None
         raw_texts = []
         for col in client_article_cols + description_cols:
             val = row.get(col, "")
-            if isinstance(val, str) and val.strip():
-                raw_texts.append(val)
+            val_clean = _clean_cell_value(val)
+            if AUTO_FIX_MOJIBAKE:
+                val_clean = maybe_fix_mojibake(val_clean)
+            if val_clean:
+                # Если клиент разделил несколько кодов или слов вертикальной чертой
+                if '|' in val_clean:
+                    parts = [p.strip() for p in val_clean.split('|') if p.strip()]
+                    raw_texts.extend(parts)
+                else:
+                    raw_texts.append(val_clean)
 
         extracted_all = []
         for txt in raw_texts:
             extracted_all.extend(extract_articles(txt))
         extracted_all = list(dict.fromkeys(extracted_all))
+
+        # Фильтрация очевидного числового шума: цены, количества, даты.
+        if FILTER_NUMERIC_NOISE and extracted_all:
+            filtered = []
+            for tok in extracted_all:
+                t = tok.strip()
+                # Уберём пробелы-разделители тысяч
+                t_compact = t.replace(" ", "")
+                # Если содержит буквы — оставляем
+                if re.search(r"[A-ZА-Я]", t_compact):
+                    filtered.append(t)
+                    continue
+                # Десятичные с точкой или запятой скорее всего цены (650.10 / 1,735)
+                if re.fullmatch(r"\d+[\.,]\d+", t_compact):
+                    continue
+                # Очень короткие чисто цифровые (<6) не совпадающие с артикулами — вероятно количество / позиция / день даты
+                if t_compact.isdigit() and len(t_compact) < 6 and t_compact not in digit_only_norms:
+                    continue
+                # Похоже на дату формата 23.09.25 или 23/09/2025
+                if re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", t_compact):
+                    continue
+                filtered.append(t)
+            extracted_all = filtered
 
         # Выбираем лучший матч по всем кандидатам, а не первый выше порога
         chosen = None  # tuple: (art, norm_art, best_row, best_score, priority_tuple)
@@ -364,23 +593,35 @@ def main_process(
             best_score = -1
             client_sig = "".join(sorted(re.findall(r"[A-ZА-Я]+", art.upper())))
             client_nums = re.findall(r"\d+", art.upper())
+            q = token_quality(art)
+
+            # 0) Быстрое точное совпадение по склеенным цифрам (форматы с/без дефисов)
+            if best_row is None:
+                digits_collapsed = re.sub(r"\D", "", art)
+                if len(digits_collapsed) >= 8:
+                    idx_digits = digits_collapse_to_index.get(digits_collapsed)
+                    if idx_digits is not None:
+                        best_row = nomenclature_df.iloc[idx_digits]
+                        best_score = 100
+                        priority = (q, 3, 100, len(norm_art))  # (quality, tier, score, length)
 
             # 1) Точное совпадение по нормализованному артикулу
-            exact_idx = norm_to_index.get(norm_art)
-            if exact_idx is not None:
-                best_row, best_score = nomenclature_df.iloc[exact_idx], 100
-                priority = (2, 100, len(norm_art))  # 2 — highest tier
-            else:
+            if best_row is None:
+                exact_idx = norm_to_index.get(norm_art)
+                if exact_idx is not None:
+                    best_row, best_score = nomenclature_df.iloc[exact_idx], 100
+                    priority = (q, 3, 100, len(norm_art))  # tier 3 highest now
+            if best_row is None:
                 # 1b) Точное совпадение по базовому ядру (без вариантных суффиксов)
                 if client_core:
                     base_idx = base_core_to_index.get(client_core)
                     if base_idx is not None:
                         best_row, best_score = nomenclature_df.iloc[base_idx], 100
-                        priority = (2, 100, len(norm_art))
+                        priority = (q, 3, 100, len(norm_art))
                     else:
-                        priority = (0, 0, 0)
+                        priority = (q, 0, 0, 0)
                 else:
-                    priority = (0, 0, 0)
+                    priority = (q, 0, 0, 0)
 
                 # 1c) Расширенный вариант/комплект: числовые токены клиента ⊆ токенов номенклатуры.
                 # Кандидатов берём по самому длинному числовому ядру (ускорение и точность семейства).
@@ -406,7 +647,7 @@ def main_process(
                     if cand_best is not None:
                         best_row = cand_best
                         best_score = cand_best_score
-                        priority = (2 if best_score >= 100 else 1, best_score, len(norm_art))
+                        priority = (q, 2 if best_score >= 100 else 1, best_score, len(norm_art))
                 # 2) Приоритет по одинаковому числовому ядру + сравнение по названию
                 if best_row is None:  # не сработали точные
                     nc = extract_numeric_core(art)
@@ -423,7 +664,7 @@ def main_process(
                         if name_best_row is not None:
                             best_row = name_best_row
                             best_score = name_best  # используем как общую уверенность
-                            priority = (1, name_best, len(norm_art))  # 1 — mid tier
+                            priority = (q, 1, name_best, len(norm_art))  # tier 1 mid
 
                 # 3) Общий fuzzy-поиск по нормализованным артикулам (если ещё не выбрали)
                 if best_row is None:
@@ -434,17 +675,17 @@ def main_process(
                         nomen_core = get_article_core(nom_row["Артикул"])
                         if client_core and nomen_core == client_core:
                             best_row, best_score = nom_row, 100
-                            priority = (2, 100, len(norm_art))
+                            priority = (q, 3, 100, len(norm_art))
                             break
                         elif score > best_score:
                             best_row, best_score = nom_row, score
-                            priority = (0, score, len(norm_art))
+                            priority = (q, 0, score, len(norm_art))
 
             if best_row is not None:
                 if chosen is None:
                     chosen = (art, norm_art, best_row, best_score, priority)
                 else:
-                    # сравниваем по priority tuple
+                    # сравниваем по priority tuple (качество -> tier -> score -> длина нормализованного)
                     if priority > chosen[4]:
                         chosen = (art, norm_art, best_row, best_score, priority)
 
@@ -526,6 +767,27 @@ def main_process(
                         "Количество (из заказа)": qty_val if qty_val is not None else "",
                     }
                 )
+                matched = True
+            else:
+                unmatched_reason = f"fallback_wratio={score}<min_score"
+        if not matched:
+            if extracted_all:
+                if chosen is not None:
+                    unmatched_reason = f"best_score={chosen[3]}<min_score"
+                else:
+                    unmatched_reason = "no_candidate_after_filters"
+            else:
+                unmatched_reason = "no_tokens_extracted"
+        if DIAG_COLLECT_UNMATCHED and not matched:
+            # Сохраняем первые 50 непросопоставленных для анализа
+            if 'diag_unmatched' not in locals():
+                diag_unmatched = []
+            if len(diag_unmatched) < 50:
+                diag_unmatched.append({
+                    'raw': raw_texts,
+                    'extracted': extracted_all,
+                    'reason': unmatched_reason
+                })
 
     # Сформируем результирующий DataFrame
     df_result = pd.DataFrame(results)
@@ -565,6 +827,10 @@ def main_process(
                         ws.cell(row=r_idx, column=c_idx).fill = green_fill
 
     print(f"✅ Готово! Найдено совпадений: {len(results)}")
+    if DIAG_COLLECT_UNMATCHED and 'diag_unmatched' in locals() and diag_unmatched:
+        print(f"[DIAG] Непросопоставленных строк: {len(diag_unmatched)} (показаны первые {len(diag_unmatched)})")
+        for d in diag_unmatched[:5]:
+            print("[DIAG] reason=", d['reason'], " raw=", " || ".join(d['raw']), " extracted=", d['extracted'])
     return len(results)
 
 
