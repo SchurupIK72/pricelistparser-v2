@@ -9,6 +9,7 @@ AUTO_FIX_MOJIBAKE = True      # попытаться починить mojibake c
 DIAG_COLLECT_UNMATCHED = True # собирать диагностическую информацию по непросопоставленным строкам
 # Брендовые / служебные слова, которые не должны побеждать в выборе артикула, если есть более "артикульные" токены
 STOPWORD_BRANDS = {"СПЕЦМАШ", "СПЕЦМAШ", "СПЕЦ", "ЕВРО", "ЕВРО4"}
+PURE_NUMERIC_MIN_KEEP = 4  # Мин. длина чисто цифрового токена, чтобы не быть отброшенным как шум (если не из article-колонки)
 OUTPUT_COLUMNS = [
     "Исходные тексты",
     "Извлеченный артикул",
@@ -467,7 +468,7 @@ def main_process(
     client_article_cols = [
         col
         for col in client_df.columns
-        if any(k in str(col).lower() for k in ["артик", "код", "номер"])
+        if any(k in str(col).lower() for k in ["артик", "код", "номер", "номенк"])
     ]
     description_cols = [
         c
@@ -542,44 +543,52 @@ def main_process(
     for _, row in client_df.iterrows():
         unmatched_reason = None
         raw_texts = []
+        raw_texts_info = []  # (text, source_col_lower)
         for col in client_article_cols + description_cols:
             val = row.get(col, "")
             val_clean = _clean_cell_value(val)
             if AUTO_FIX_MOJIBAKE:
                 val_clean = maybe_fix_mojibake(val_clean)
             if val_clean:
-                # Если клиент разделил несколько кодов или слов вертикальной чертой
                 if '|' in val_clean:
                     parts = [p.strip() for p in val_clean.split('|') if p.strip()]
-                    raw_texts.extend(parts)
+                    for p in parts:
+                        raw_texts.append(p)
+                        raw_texts_info.append((p, str(col).lower()))
                 else:
                     raw_texts.append(val_clean)
+                    raw_texts_info.append((val_clean, str(col).lower()))
 
-        extracted_all = []
-        for txt in raw_texts:
-            extracted_all.extend(extract_articles(txt))
-        extracted_all = list(dict.fromkeys(extracted_all))
+        # Извлекаем токены с учётом источника
+        token_origin = {}  # token -> True если из article-подобного столбца
+        for txt, col_lower in raw_texts_info:
+            tokens_here = extract_articles(txt)
+            is_article_col = any(k in col_lower for k in ["артик", "код", "номер", "номенк"])
+            for tok in tokens_here:
+                token_origin.setdefault(tok, is_article_col)
+
+        extracted_all = list(token_origin.keys())
 
         # Фильтрация очевидного числового шума: цены, количества, даты.
         if FILTER_NUMERIC_NOISE and extracted_all:
             filtered = []
             for tok in extracted_all:
                 t = tok.strip()
-                # Уберём пробелы-разделители тысяч
                 t_compact = t.replace(" ", "")
                 # Если содержит буквы — оставляем
                 if re.search(r"[A-ZА-Я]", t_compact):
                     filtered.append(t)
                     continue
-                # Десятичные с точкой или запятой скорее всего цены (650.10 / 1,735)
+                # Десятичные с точкой или запятой скорее всего цены
                 if re.fullmatch(r"\d+[\.,]\d+", t_compact):
                     continue
-                # Очень короткие чисто цифровые (<6) не совпадающие с артикулами — вероятно количество / позиция / день даты
-                if t_compact.isdigit() and len(t_compact) < 6 and t_compact not in digit_only_norms:
-                    continue
-                # Похоже на дату формата 23.09.25 или 23/09/2025
+                # Дата
                 if re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", t_compact):
                     continue
+                # Короткие чисто цифровые: фильтруем если не из article-колонки
+                if t_compact.isdigit() and t_compact not in digit_only_norms:
+                    if len(t_compact) < PURE_NUMERIC_MIN_KEEP and not token_origin.get(tok, False):
+                        continue
                 filtered.append(t)
             extracted_all = filtered
 
