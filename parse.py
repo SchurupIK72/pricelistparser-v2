@@ -17,10 +17,21 @@ OUTPUT_COLUMNS = [
     "Совпадение (из номенклатуры)",
     "Название (из номенклатуры)",
     "Нормализованный артикул совпадения",
+    # Новый столбец будет вставлен программно (RAW_SCORE_COLUMN) перед финальным процентом совпадения
     "Процент совпадения",
     "Цена",
     "Количество (из заказа)",
 ]
+
+# Колонка для фиксации исходного (сырого) процента совпадения до возможного повышения для вариантов
+RAW_SCORE_COLUMN = "Сырой процент совпадения"
+if RAW_SCORE_COLUMN not in OUTPUT_COLUMNS:
+    # Вставляем прямо перед "Процент совпадения"
+    try:
+        idx_pc = OUTPUT_COLUMNS.index("Процент совпадения")
+        OUTPUT_COLUMNS.insert(idx_pc, RAW_SCORE_COLUMN)
+    except ValueError:
+        OUTPUT_COLUMNS.append(RAW_SCORE_COLUMN)
 
 
 def smart_engine(path: str) -> str:
@@ -740,11 +751,20 @@ def main_process(
                     qty_val = v
                     break
 
-            # Если 100% совпадение ИЛИ найден вариант с хвостом -СПЕЦМАШ/-PRO-СПЕЦМАШ —
-            # выводим все вариантные строки (PRO-СПЕЦМАШ, -СПЕЦМАШ, базовый) и считаем их 100% эквивалентными.
+            # Строгое условие расширения вариантов: либо точные 100%, либо суффикс варианта с высоким скором и совпадением базового ядра
             art_name_upper = str(best_row["Артикул"]).upper()
-            if best_score == 100 or art_name_upper.endswith("-СПЕЦМАШ") or art_name_upper.endswith("-PRO-СПЕЦМАШ"):
-                # поднимаем групповое совпадение до 100
+            client_core_now = get_article_core(art)
+            best_core_now = get_article_core(str(best_row["Артикул"]))
+            base_match = client_core_now and best_core_now and client_core_now == best_core_now
+            has_variant_suffix = art_name_upper.endswith("-СПЕЦМАШ") or art_name_upper.endswith("-PRO-СПЕЦМАШ")
+            expand_variants = (
+                best_score == 100 or (
+                    has_variant_suffix and best_score >= 95 and base_match
+                )
+            )
+
+            if expand_variants:
+                original_score = best_score
                 base_key = variant_base(str(best_row["Артикул"]))
                 variant_indices = list(base_to_variants.get(base_key, {best_row.name}))
                 variant_indices.sort(key=lambda i: variant_rank(str(nomenclature_df.iloc[i]["Артикул"])))
@@ -759,6 +779,7 @@ def main_process(
                             "Совпадение (из номенклатуры)": vrow["Артикул"],
                             "Название (из номенклатуры)": vrow.get(nom_name_col, "") if nom_name_col else "",
                             "Нормализованный артикул совпадения": normalize_article(vrow["Артикул"]),
+                            RAW_SCORE_COLUMN: original_score,
                             "Процент совпадения": 100,
                             "Цена": (price_val_nom if (price_val_nom is not None and str(price_val_nom).strip() != "") else (price_val_client if price_val_client is not None else "")),
                             "Количество (из заказа)": qty_val if qty_val is not None else "",
@@ -774,6 +795,7 @@ def main_process(
                         "Совпадение (из номенклатуры)": best_row["Артикул"],
                         "Название (из номенклатуры)": best_row.get(nom_name_col, "") if nom_name_col else "",
                         "Нормализованный артикул совпадения": normalize_article(best_row["Артикул"]),
+                        RAW_SCORE_COLUMN: best_score,
                         "Процент совпадения": best_score,
                         "Цена": (price_val_nom if (price_val_nom is not None and str(price_val_nom).strip() != "") else (price_val_client if price_val_client is not None else "")),
                         "Количество (из заказа)": qty_val if qty_val is not None else "",
@@ -817,6 +839,7 @@ def main_process(
                         "Совпадение (из номенклатуры)": best_row["Артикул"],
                         "Название (из номенклатуры)": best_row.get(nom_name_col, "") if nom_name_col else "",
                         "Нормализованный артикул совпадения": normalize_article(best_row["Артикул"]),
+                        RAW_SCORE_COLUMN: score,
                         "Процент совпадения": score,
                         "Цена": (price_val_nom if (price_val_nom is not None and str(price_val_nom).strip() != "") else (price_val_client if price_val_client is not None else "")),
                         "Количество (из заказа)": qty_val if qty_val is not None else "",
