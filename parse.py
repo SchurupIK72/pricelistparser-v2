@@ -533,6 +533,8 @@ def main_process(
             num_core_to_indices.setdefault(nc, []).append(idx)
 
     results = []
+    # Будем копить непросопоставленные строки для отдельной вкладки
+    unmatched_rows = []  # каждый элемент: dict с сырыми текстами, извлеченными токенами, причиной и исходными колонками
 
     def token_quality(tok: str) -> int:
         """Эвристический приоритет "артикульности" токена.
@@ -841,6 +843,21 @@ def main_process(
                     'extracted': extracted_all,
                     'reason': unmatched_reason
                 })
+        # Накапливаем для итоговой таблицы непросопоставленных
+        if not matched:
+            row_record = {
+                'Исходные тексты': " | ".join(raw_texts) if raw_texts else "",
+                'Извлеченные токены': ", ".join(extracted_all) if extracted_all else "",
+                'Причина': unmatched_reason or "",
+            }
+            # Добавим исходные значения клиентских колонок (чтобы можно было анализировать)
+            for col in client_df.columns:
+                try:
+                    val = row.get(col, "")
+                except Exception:
+                    val = ""
+                row_record[f'CLIENT::{col}'] = val
+            unmatched_rows.append(row_record)
 
     # Сформируем результирующий DataFrame
     df_result = pd.DataFrame(results)
@@ -852,10 +869,17 @@ def main_process(
     # Отбрасываем лишние столбцы и упорядочиваем по эталону
     df_result = df_result[OUTPUT_COLUMNS]
 
+    # Подготовим DataFrame непросопоставленных
+    df_unmatched = pd.DataFrame(unmatched_rows)
+
     # Запишем в Excel и подсветим зеленым строки со 100% совпадением
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         sheet_name = "Sheet1"
         df_result.to_excel(writer, index=False, sheet_name=sheet_name)
+        # Имя вкладки для непросопоставленных: OutResult+<название результирующей вкладки>
+        unmatched_sheet_name = f"OutResult+{sheet_name}"[:31]  # Excel limit 31 chars
+        if not df_unmatched.empty:
+            df_unmatched.to_excel(writer, index=False, sheet_name=unmatched_sheet_name)
 
         # Получаем лист и применяем заливку строкам с 100%
         ws = writer.sheets[sheet_name]
