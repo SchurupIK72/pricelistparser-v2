@@ -418,6 +418,27 @@ def main_process(
     if "Артикул" not in nomenclature_df.columns:
         raise RuntimeError("Не найдена колонка 'Артикул' в номенклатуре")
 
+    # === Варианты артикулов: базовый / -СПЕЦМАШ / -PRO-СПЕЦМАШ ===
+    SPEC_VARIANT_RE = re.compile(r"(?:-PRO)?-СПЕЦМАШ$", re.IGNORECASE)
+
+    def variant_base(a: str) -> str:
+        if not isinstance(a, str):
+            return ""
+        return SPEC_VARIANT_RE.sub("", a.upper()).strip()
+
+    def variant_rank(a: str) -> int:
+        au = a.upper()
+        if au.endswith("-PRO-СПЕЦМАШ"):
+            return 0  # сначала PRO
+        if au.endswith("-СПЕЦМАШ"):
+            return 1  # потом просто -СПЕЦМАШ
+        return 2      # затем базовый
+
+    base_to_variants = {}
+    for idx_v, a_v in enumerate(nomenclature_df["Артикул"].astype(str)):
+        base_key = variant_base(a_v)
+        base_to_variants.setdefault(base_key, set()).add(idx_v)
+
     nomenclature_df["Нормализованный артикул"] = nomenclature_df["Артикул"].apply(normalize_article)
     nomenclature_df["Базовое ядро"] = nomenclature_df["Артикул"].apply(get_article_core)
     # Доп. признаки для сопоставления комплектов: буквенная сигнатура и набор числовых токенов
@@ -717,22 +738,45 @@ def main_process(
                     qty_val = v
                     break
 
-            # Цена из номенклатуры приоритетнее
-            price_val_nom = best_row.get(nom_price_col, None) if nom_price_col else None
-
-            results.append(
-                {
-                    "Исходные тексты": " | ".join(raw_texts) if raw_texts else "",
-                    "Извлеченный артикул": art,
-                    "Нормализованный артикул клиента": norm_art,
-                    "Совпадение (из номенклатуры)": best_row["Артикул"],
-                    "Название (из номенклатуры)": best_row.get(nom_name_col, "") if nom_name_col else "",
-                    "Нормализованный артикул совпадения": normalize_article(best_row["Артикул"]),
-                    "Процент совпадения": best_score,
-                    "Цена": (price_val_nom if (price_val_nom is not None and str(price_val_nom).strip() != "") else (price_val_client if price_val_client is not None else "")),
-                    "Количество (из заказа)": qty_val if qty_val is not None else "",
-                }
-            )
+            # Если 100% совпадение ИЛИ найден вариант с хвостом -СПЕЦМАШ/-PRO-СПЕЦМАШ —
+            # выводим все вариантные строки (PRO-СПЕЦМАШ, -СПЕЦМАШ, базовый) и считаем их 100% эквивалентными.
+            art_name_upper = str(best_row["Артикул"]).upper()
+            if best_score == 100 or art_name_upper.endswith("-СПЕЦМАШ") or art_name_upper.endswith("-PRO-СПЕЦМАШ"):
+                # поднимаем групповое совпадение до 100
+                base_key = variant_base(str(best_row["Артикул"]))
+                variant_indices = list(base_to_variants.get(base_key, {best_row.name}))
+                variant_indices.sort(key=lambda i: variant_rank(str(nomenclature_df.iloc[i]["Артикул"])))
+                for vidx in variant_indices:
+                    vrow = nomenclature_df.iloc[vidx]
+                    price_val_nom = vrow.get(nom_price_col, None) if nom_price_col else None
+                    results.append(
+                        {
+                            "Исходные тексты": " | ".join(raw_texts) if raw_texts else "",
+                            "Извлеченный артикул": art,
+                            "Нормализованный артикул клиента": norm_art,
+                            "Совпадение (из номенклатуры)": vrow["Артикул"],
+                            "Название (из номенклатуры)": vrow.get(nom_name_col, "") if nom_name_col else "",
+                            "Нормализованный артикул совпадения": normalize_article(vrow["Артикул"]),
+                            "Процент совпадения": 100,
+                            "Цена": (price_val_nom if (price_val_nom is not None and str(price_val_nom).strip() != "") else (price_val_client if price_val_client is not None else "")),
+                            "Количество (из заказа)": qty_val if qty_val is not None else "",
+                        }
+                    )
+            else:
+                price_val_nom = best_row.get(nom_price_col, None) if nom_price_col else None
+                results.append(
+                    {
+                        "Исходные тексты": " | ".join(raw_texts) if raw_texts else "",
+                        "Извлеченный артикул": art,
+                        "Нормализованный артикул клиента": norm_art,
+                        "Совпадение (из номенклатуры)": best_row["Артикул"],
+                        "Название (из номенклатуры)": best_row.get(nom_name_col, "") if nom_name_col else "",
+                        "Нормализованный артикул совпадения": normalize_article(best_row["Артикул"]),
+                        "Процент совпадения": best_score,
+                        "Цена": (price_val_nom if (price_val_nom is not None and str(price_val_nom).strip() != "") else (price_val_client if price_val_client is not None else "")),
+                        "Количество (из заказа)": qty_val if qty_val is not None else "",
+                    }
+                )
             matched = True
 
         if not matched and raw_texts:
