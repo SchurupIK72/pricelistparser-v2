@@ -11,27 +11,45 @@ DIAG_COLLECT_UNMATCHED = True # собирать диагностическую 
 STOPWORD_BRANDS = {"СПЕЦМАШ", "СПЕЦМAШ", "СПЕЦ", "ЕВРО", "ЕВРО4"}
 PURE_NUMERIC_MIN_KEEP = 4  # Мин. длина чисто цифрового токена, чтобы не быть отброшенным как шум (если не из article-колонки)
 OUTPUT_COLUMNS = [
+    # 1. Исходный текст (как было)
     "Исходные тексты",
+    # 2. Название из номенклатуры
+    "Название (из номенклатуры)",
+    # 3. Совпадение (артикул) из номенклатуры
+    "Совпадение (из номенклатуры)",
+    # 4. Финальный процент совпадения (не сырой)
+    "Процент совпадения",
+    # 5. Цена
+    "Цена",
+    # 6. Нормализованный артикул совпадения
+    "Нормализованный артикул совпадения",
+    # Остальные — в любом порядке (сохраняем существующие, чтобы не ломать логику)
     "Извлеченный артикул",
     "Нормализованный артикул клиента",
-    "Совпадение (из номенклатуры)",
-    "Название (из номенклатуры)",
-    "Нормализованный артикул совпадения",
-    # Новый столбец будет вставлен программно (RAW_SCORE_COLUMN) перед финальным процентом совпадения
-    "Процент совпадения",
-    "Цена",
     "Количество (из заказа)",
 ]
 
 # Колонка для фиксации исходного (сырого) процента совпадения до возможного повышения для вариантов
 RAW_SCORE_COLUMN = "Сырой процент совпадения"
-if RAW_SCORE_COLUMN not in OUTPUT_COLUMNS:
-    # Вставляем прямо перед "Процент совпадения"
-    try:
-        idx_pc = OUTPUT_COLUMNS.index("Процент совпадения")
-        OUTPUT_COLUMNS.insert(idx_pc, RAW_SCORE_COLUMN)
-    except ValueError:
-        OUTPUT_COLUMNS.append(RAW_SCORE_COLUMN)
+# Перемещаем сырой процент в самый конец (после основных столбцов)
+if RAW_SCORE_COLUMN in OUTPUT_COLUMNS:
+    OUTPUT_COLUMNS = [c for c in OUTPUT_COLUMNS if c != RAW_SCORE_COLUMN]
+OUTPUT_COLUMNS.append(RAW_SCORE_COLUMN)
+
+# --- КОНФИГУРАЦИЯ КЛЮЧЕВЫХ СЛОВ ДЛЯ ФИЛЬТРА ПО СМЫСЛУ ---
+# Включить защиту по ключевым словам: строгие совпадения (tier 3 со score 100) будут понижены,
+# если название номенклатуры не содержит ни одного значимого ключевого слова из строки заказа.
+ENABLE_KEYWORD_GUARD = True
+# Минимальная длина слова, чтобы считаться ключевым
+KEYWORD_MIN_KEY_LEN = 3
+# Минимальное количество общих ключевых слов (>=1 по умолчанию)
+KEYWORD_REQUIRED_OVERLAP = 1
+# Минимальная похожесть имени (WRatio) при отсутствии ключей, чтобы НЕ понижать (fallback)
+KEYWORD_ALLOW_IF_NAME_SIM = 75
+# Стоп-слова (не повышающие смысл):
+KEYWORD_STOPWORDS = {
+    'И','В','НА','ДЛЯ','THE','A','OF','ОТ','ПО','С','К','ДО','ON','WITH','БЕЗ','КОМПЛЕКТ','НАБОР','ЗАДНИЙ','ПЕРЕДНИЙ','ЛЕВЫЙ','ПРАВЫЙ','ПР-ВО','ПАРА'
+}
 
 
 def smart_engine(path: str) -> str:
@@ -637,6 +655,13 @@ def main_process(
             client_sig = "".join(sorted(re.findall(r"[A-ZА-Я]+", art.upper())))
             client_nums = re.findall(r"\d+", art.upper())
             q = token_quality(art)
+            is_variant_suffix_token = art.upper().endswith("-СПЕЦМАШ") or art.upper().endswith("-PRO-СПЕЦМАШ")
+
+            # Подготовка ключевых слов строки (делаем один раз на первую итерацию — кешируем в локальной переменной)
+            if 'row_keywords' not in locals():
+                joined_lower = (" ".join(raw_texts)).lower()
+                cand_words = re.findall(r"[a-zа-я0-9_-]{%d,}" % KEYWORD_MIN_KEY_LEN, joined_lower, flags=re.IGNORECASE)
+                row_keywords = {w for w in cand_words if w.upper() not in STOPWORD_BRANDS and w.upper() not in KEYWORD_STOPWORDS}
 
             # 0) Быстрое точное совпадение по склеенным цифрам (форматы с/без дефисов)
             if best_row is None:
@@ -725,6 +750,37 @@ def main_process(
                             priority = (q, 0, score, len(norm_art))
 
             if best_row is not None:
+                # Дополнительное ослабление при низкой релевантности названия: если совпадение 100% ("жёсткая" ветка)
+                # но текст строки не похож на название номенклатуры (например, артикул турбокомпрессора в строке про крыло),
+                # понижаем tier, чтобы другой кандидат мог победить.
+                try:
+                    name_val = str(best_row.get(nom_name_col, "")) if nom_name_col else ""
+                except Exception:
+                    name_val = ""
+                if name_val and best_score == 100 and priority[1] == 3:
+                    # similarity по объединённому тексту строки
+                    try:
+                        name_sim = fuzz.WRatio(raw_join_upper, name_val.upper()) if raw_join_upper else 0
+                    except Exception:
+                        name_sim = 0
+                    # Совпадение базового ядра клиента и найденного артикула
+                    base_match_for_exact = False
+                    if client_core and isinstance(best_row.get("Артикул"), str):
+                        base_match_for_exact = (client_core == get_article_core(best_row["Артикул"]))
+                    degrade = False
+                    # 1) Старое правило: низкая похожесть и нет совпадения базового ядра
+                    if name_sim < 60 and not base_match_for_exact:
+                        degrade = True
+                    # 2) Ключевые слова: если включено, требуем пересечение ключей (кроме случая когда высокая похожесть имени)
+                    if ENABLE_KEYWORD_GUARD:
+                        # Ключевые слова из названия номенклатуры
+                        name_words = set(re.findall(r"[a-zа-я0-9_-]{%d,}" % KEYWORD_MIN_KEY_LEN, name_val.lower(), flags=re.IGNORECASE))
+                        name_keywords = {w for w in name_words if w.upper() not in STOPWORD_BRANDS and w.upper() not in KEYWORD_STOPWORDS}
+                        overlap = row_keywords & name_keywords if row_keywords else set()
+                        if not overlap and name_sim < KEYWORD_ALLOW_IF_NAME_SIM:
+                            degrade = True
+                    if degrade:
+                        priority = (priority[0], 1, priority[2], priority[3])
                 if chosen is None:
                     chosen = (art, norm_art, best_row, best_score, priority)
                 else:
