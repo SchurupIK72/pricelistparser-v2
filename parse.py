@@ -10,7 +10,10 @@ DIAG_COLLECT_UNMATCHED = True # собирать диагностическую 
 # Брендовые / служебные слова, которые не должны побеждать в выборе артикула, если есть более "артикульные" токены
 STOPWORD_BRANDS = {"СПЕЦМАШ", "СПЕЦМAШ", "СПЕЦ", "ЕВРО", "ЕВРО4"}
 PURE_NUMERIC_MIN_KEEP = 4  # Мин. длина чисто цифрового токена, чтобы не быть отброшенным как шум (если не из article-колонки)
+ORDER_LINE_COLUMN = "Номер строки заказа"  # последовательный номер строки исходного заказа
 OUTPUT_COLUMNS = [
+    # 0. Номер строки заказа (для группировки вариантов -СПЕЦМАШ / -PRO-СПЕЦМАШ)
+    ORDER_LINE_COLUMN,
     # 1. Исходный текст (как было)
     "Исходные тексты",
     # 2. Название из номенклатуры
@@ -595,7 +598,7 @@ def main_process(
             return 1
         return 0
 
-    for _, row in client_df.iterrows():
+    for line_idx, (_, row) in enumerate(client_df.iterrows(), start=1):
         unmatched_reason = None
         raw_texts = []
         raw_texts_info = []  # (text, source_col_lower)
@@ -832,6 +835,7 @@ def main_process(
                     price_val_nom = vrow.get(nom_price_col, None) if nom_price_col else None
                     results.append(
                         {
+                            ORDER_LINE_COLUMN: line_idx,
                             "Исходные тексты": " | ".join(raw_texts) if raw_texts else "",
                             "Извлеченный артикул": art,
                             "Нормализованный артикул клиента": norm_art,
@@ -848,6 +852,7 @@ def main_process(
                 price_val_nom = best_row.get(nom_price_col, None) if nom_price_col else None
                 results.append(
                     {
+                        ORDER_LINE_COLUMN: line_idx,
                         "Исходные тексты": " | ".join(raw_texts) if raw_texts else "",
                         "Извлеченный артикул": art,
                         "Нормализованный артикул клиента": norm_art,
@@ -892,6 +897,7 @@ def main_process(
 
                 results.append(
                     {
+                        ORDER_LINE_COLUMN: line_idx,
                         "Исходные тексты": txt,
                         "Извлеченный артикул": "",
                         "Нормализованный артикул клиента": "",
@@ -928,6 +934,7 @@ def main_process(
         # Накапливаем для итоговой таблицы непросопоставленных
         if not matched:
             row_record = {
+                ORDER_LINE_COLUMN: line_idx,
                 'Исходные тексты': " | ".join(raw_texts) if raw_texts else "",
                 'Извлеченные токены': ", ".join(extracted_all) if extracted_all else "",
                 'Причина': unmatched_reason or "",
