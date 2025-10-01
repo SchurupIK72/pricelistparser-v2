@@ -8,28 +8,42 @@ class ParserApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Парсер прайсов")
+        # Увеличим окно и дадим возможность растягивать
+        try:
+            self.root.geometry("1200x480")
+        except Exception:
+            pass
+        for c in range(0, 3):
+            self.root.grid_columnconfigure(c, weight=1)
+        self.root.grid_rowconfigure(5, weight=1)
 
-        tk.Label(root, text="Файл клиента:").grid(row=0, column=0, sticky="w")
-        self.client_entry = tk.Entry(root, width=60); self.client_entry.grid(row=0, column=1)
-        tk.Button(root, text="Обзор", command=self.browse_client).grid(row=0, column=2)
+        entry_width = 120  # было 60, теперь в 2 раза шире
 
-        tk.Label(root, text="Файл номенклатуры:").grid(row=1, column=0, sticky="w")
-        self.nom_entry = tk.Entry(root, width=60); self.nom_entry.grid(row=1, column=1)
-        tk.Button(root, text="Обзор", command=self.browse_nom).grid(row=1, column=2)
+        tk.Label(root, text="Файл клиента:").grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        self.client_entry = tk.Entry(root, width=entry_width)
+        self.client_entry.grid(row=0, column=1, sticky="we", padx=4, pady=2)
+        tk.Button(root, text="Обзор", command=self.browse_client).grid(row=0, column=2, sticky="we", padx=4, pady=2)
 
-        tk.Label(root, text="Файл результата:").grid(row=2, column=0, sticky="w")
-        self.out_entry = tk.Entry(root, width=60); self.out_entry.grid(row=2, column=1)
-        tk.Button(root, text="Сохранить как", command=self.save_output).grid(row=2, column=2)
+        tk.Label(root, text="Файл номенклатуры:").grid(row=1, column=0, sticky="w", padx=4, pady=2)
+        self.nom_entry = tk.Entry(root, width=entry_width)
+        self.nom_entry.grid(row=1, column=1, sticky="we", padx=4, pady=2)
+        tk.Button(root, text="Обзор", command=self.browse_nom).grid(row=1, column=2, sticky="we", padx=4, pady=2)
 
-        tk.Label(root, text="Порог % совпадения:").grid(row=3, column=0, sticky="w")
-        self.score_entry = tk.Entry(root, width=10); self.score_entry.insert(0, str(parse.DEFAULT_MIN_MATCH_SCORE))
-        self.score_entry.grid(row=3, column=1, sticky="w")
+        tk.Label(root, text="Файл результата:").grid(row=2, column=0, sticky="w", padx=4, pady=2)
+        self.out_entry = tk.Entry(root, width=entry_width)
+        self.out_entry.grid(row=2, column=1, sticky="we", padx=4, pady=2)
+        tk.Button(root, text="Сохранить как", command=self.save_output).grid(row=2, column=2, sticky="we", padx=4, pady=2)
+
+        tk.Label(root, text="Порог % совпадения:").grid(row=3, column=0, sticky="w", padx=4, pady=2)
+        self.score_entry = tk.Entry(root, width=10)
+        self.score_entry.insert(0, str(parse.DEFAULT_MIN_MATCH_SCORE))
+        self.score_entry.grid(row=3, column=1, sticky="w", padx=4, pady=2)
 
         self.start_button = tk.Button(root, text="Запустить", command=self.start_process)
-        self.start_button.grid(row=4, column=0, columnspan=3, pady=10)
+        self.start_button.grid(row=4, column=0, columnspan=3, pady=10, padx=4, sticky="w")
 
-        self.log_text = tk.Text(root, height=10, width=80, state="disabled")
-        self.log_text.grid(row=5, column=0, columnspan=3)
+        self.log_text = tk.Text(root, height=12, width=entry_width + 20, state="disabled")
+        self.log_text.grid(row=5, column=0, columnspan=3, sticky="nsew", padx=4, pady=4)
 
     def browse_client(self):
         fn = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx;*.xls")])
