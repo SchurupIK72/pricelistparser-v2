@@ -638,9 +638,20 @@ def main_process(
                 if re.search(r"[A-ZА-Я]", t_compact):
                     filtered.append(t)
                     continue
-                # Десятичные с точкой или запятой скорее всего цены
+                # Десятичные с точкой или запятой: отличаем цену (обычно <=2 знаков после разделителя)
+                # от артикулов вида 11.8407010 (длинная вторая часть).
                 if re.fullmatch(r"\d+[\.,]\d+", t_compact):
-                    continue
+                    # Определяем длину дробной части
+                    if '.' in t_compact:
+                        left, right = t_compact.split('.', 1)
+                    elif ',' in t_compact:
+                        left, right = t_compact.split(',', 1)
+                    else:
+                        left, right = t_compact, ''
+                    # Если дробная часть короткая (<=2) — трактуем как цену и фильтруем.
+                    # Если длинная (>=3) — оставляем как потенциальный артикул с точкой.
+                    if len(right) <= 2:
+                        continue
                 # Дата
                 if re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", t_compact):
                     continue
@@ -979,7 +990,9 @@ def main_process(
     # result+<заданный_порог>.xlsx (порог = min_score) в папке клиента
     if not user_provided_output:
         client_dir = os.path.dirname(os.path.abspath(client_path)) or os.getcwd()
-        dynamic_name = f"result+{min_score}.xlsx"
+        client_base = os.path.splitext(os.path.basename(client_path))[0]
+        # Формат: result+<порог>+<имя_исходного_файла_без_расширения>.xlsx
+        dynamic_name = f"result+{min_score}+{client_base}.xlsx"
         output_path = os.path.join(client_dir, dynamic_name)
     print(f"[INFO] Файл результата: {output_path}")
 
