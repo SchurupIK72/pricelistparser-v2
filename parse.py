@@ -1012,18 +1012,88 @@ def main_process(
 
         if PatternFill is not None and "Процент совпадения" in df_result.columns:
             green_fill = PatternFill(fill_type="solid", start_color="C6EFCE", end_color="C6EFCE")
-            # Данные начинаются со 2-й строки (1-я — заголовки)
+            dark_green_fill = PatternFill(fill_type="solid", start_color="82B366", end_color="82B366")  # более тёмный для семейств
+            variant_suffixes = ("-СПЕЦМАШ", "-PRO-СПЕЦМАШ")
+            # Подсчёт количества строк на каждый номер заказа
+            try:
+                line_counts = df_result[ORDER_LINE_COLUMN].value_counts()
+                multi_line_numbers = {ln for ln, cnt in line_counts.items() if cnt >= 2}
+            except Exception:
+                multi_line_numbers = set()
+            # Предполагаем доступ к функции variant_base (определена выше в main_process)
+            # Построим карту: номер строки -> список артикулов совпадения
+            line_to_articles = {}
+            if ORDER_LINE_COLUMN in df_result.columns and "Совпадение (из номенклатуры)" in df_result.columns:
+                for ln, art_match in zip(df_result[ORDER_LINE_COLUMN], df_result["Совпадение (из номенклатуры)"]):
+                    try:
+                        line_to_articles.setdefault(ln, []).append(str(art_match))
+                    except Exception:
+                        pass
+            # Определим для каких номеров строк есть семейства с вариантами (наличие хотя бы одного вариантного суффикса)
+            family_lines_with_variants = set()
+            line_base_keys_with_variant = {}
+            for ln, arts in line_to_articles.items():
+                if ln not in multi_line_numbers:
+                    continue
+                has_variant = any(isinstance(a, str) and a.upper().endswith(variant_suffixes) for a in arts)
+                if not has_variant:
+                    continue
+                family_lines_with_variants.add(ln)
+                # Собираем базовые ключи для всех артикулов в этой строке
+                base_keys = set()
+                for a in arts:
+                    if isinstance(a, str):
+                        try:
+                            base_keys.add(variant_base(a))
+                        except Exception:
+                            pass
+                line_base_keys_with_variant[ln] = base_keys
+            # Индексы нужных столбцов
+            try:
+                match_col_index = OUTPUT_COLUMNS.index("Совпадение (из номенклатуры)") + 1
+            except ValueError:
+                match_col_index = None
+            try:
+                order_line_col_index = OUTPUT_COLUMNS.index(ORDER_LINE_COLUMN) + 1
+            except ValueError:
+                order_line_col_index = None
+            # Цикл по строкам листа (данные начинаются со 2-й)
             for r_idx, score in enumerate(df_result["Процент совпадения"], start=2):
-                # Аккуратно приводим к float (поддержка строк с запятой)
                 is_hundred = False
                 try:
                     val = float(str(score).replace(",", "."))
                     is_hundred = abs(val - 100.0) < 1e-9
                 except Exception:
                     pass
-                if is_hundred:
-                    for c_idx in range(1, len(OUTPUT_COLUMNS) + 1):
-                        ws.cell(row=r_idx, column=c_idx).fill = green_fill
+                if not is_hundred:
+                    continue
+                row_fill = green_fill  # default
+                try:
+                    line_number_val = ws.cell(row=r_idx, column=order_line_col_index).value if order_line_col_index else None
+                except Exception:
+                    line_number_val = None
+                if match_col_index is not None and line_number_val in family_lines_with_variants:
+                    try:
+                        art_match_val = ws.cell(row=r_idx, column=match_col_index).value
+                    except Exception:
+                        art_match_val = None
+                    make_dark = False
+                    if isinstance(art_match_val, str):
+                        up = art_match_val.upper()
+                        if up.endswith(variant_suffixes):
+                            make_dark = True  # сам вариант
+                        else:
+                            # Базовый артикул: красим если его базовый ключ совпадает с базовым ключом любого вариантного
+                            try:
+                                base_key = variant_base(art_match_val)
+                                if base_key and base_key in line_base_keys_with_variant.get(line_number_val, set()):
+                                    make_dark = True
+                            except Exception:
+                                pass
+                    if make_dark:
+                        row_fill = dark_green_fill
+                for c_idx in range(1, len(OUTPUT_COLUMNS) + 1):
+                    ws.cell(row=r_idx, column=c_idx).fill = row_fill
 
     print(f"✅ Готово! Найдено совпадений: {len(results)}")
     if DIAG_COLLECT_UNMATCHED and 'diag_unmatched' in locals() and diag_unmatched:
