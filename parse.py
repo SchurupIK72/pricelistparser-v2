@@ -599,6 +599,8 @@ def main_process(
         return 0
 
     for line_idx, (_, row) in enumerate(client_df.iterrows(), start=1):
+        # Множество уже добавленных артикулов номенклатуры для данной строки заказа (чтобы избежать дублей)
+        emitted_articles_this_row = set()
         unmatched_reason = None
         raw_texts = []
         raw_texts_info = []  # (text, source_col_lower)
@@ -832,6 +834,11 @@ def main_process(
                 variant_indices.sort(key=lambda i: variant_rank(str(nomenclature_df.iloc[i]["Артикул"])))
                 for vidx in variant_indices:
                     vrow = nomenclature_df.iloc[vidx]
+                    art_nom = str(vrow["Артикул"]) if isinstance(vrow.get("Артикул"), str) else str(vrow.get("Артикул", ""))
+                    # Пропускаем, если уже выводили этот артикул для текущей строки заказа
+                    if art_nom in emitted_articles_this_row:
+                        continue
+                    emitted_articles_this_row.add(art_nom)
                     price_val_nom = vrow.get(nom_price_col, None) if nom_price_col else None
                     results.append(
                         {
@@ -850,6 +857,11 @@ def main_process(
                     )
             else:
                 price_val_nom = best_row.get(nom_price_col, None) if nom_price_col else None
+                single_art_nom = str(best_row["Артикул"]) if isinstance(best_row.get("Артикул"), str) else str(best_row.get("Артикул", ""))
+                if single_art_nom in emitted_articles_this_row:
+                    # Уже добавлен этим или предыдущим токеном — пропускаем дублирующую запись
+                    continue
+                emitted_articles_this_row.add(single_art_nom)
                 results.append(
                     {
                         ORDER_LINE_COLUMN: line_idx,
@@ -895,21 +907,24 @@ def main_process(
                 # Цена из номенклатуры приоритетнее
                 price_val_nom = best_row.get(nom_price_col, None) if nom_price_col else None
 
-                results.append(
-                    {
-                        ORDER_LINE_COLUMN: line_idx,
-                        "Исходные тексты": txt,
-                        "Извлеченный артикул": "",
-                        "Нормализованный артикул клиента": "",
-                        "Совпадение (из номенклатуры)": best_row["Артикул"],
-                        "Название (из номенклатуры)": best_row.get(nom_name_col, "") if nom_name_col else "",
-                        "Нормализованный артикул совпадения": normalize_article(best_row["Артикул"]),
-                        RAW_SCORE_COLUMN: score,
-                        "Процент совпадения": score,
-                        "Цена": (price_val_nom if (price_val_nom is not None and str(price_val_nom).strip() != "") else (price_val_client if price_val_client is not None else "")),
-                        "Количество (из заказа)": qty_val if qty_val is not None else "",
-                    }
-                )
+                fallback_art_nom = str(best_row["Артикул"]) if isinstance(best_row.get("Артикул"), str) else str(best_row.get("Артикул", ""))
+                if fallback_art_nom not in emitted_articles_this_row:
+                    emitted_articles_this_row.add(fallback_art_nom)
+                    results.append(
+                        {
+                            ORDER_LINE_COLUMN: line_idx,
+                            "Исходные тексты": txt,
+                            "Извлеченный артикул": "",
+                            "Нормализованный артикул клиента": "",
+                            "Совпадение (из номенклатуры)": best_row["Артикул"],
+                            "Название (из номенклатуры)": best_row.get(nom_name_col, "") if nom_name_col else "",
+                            "Нормализованный артикул совпадения": normalize_article(best_row["Артикул"]),
+                            RAW_SCORE_COLUMN: score,
+                            "Процент совпадения": score,
+                            "Цена": (price_val_nom if (price_val_nom is not None and str(price_val_nom).strip() != "") else (price_val_client if price_val_client is not None else "")),
+                            "Количество (из заказа)": qty_val if qty_val is not None else "",
+                        }
+                    )
                 matched = True
             else:
                 unmatched_reason = f"fallback_wratio={score}<min_score"
