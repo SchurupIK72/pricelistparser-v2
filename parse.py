@@ -978,6 +978,16 @@ def main_process(
         except Exception:
             PatternFill = None
 
+        # Закрепляем шапку (freeze header) для удобства просмотра больших таблиц
+        try:
+            ws.freeze_panes = ws["A2"]  # фиксируем первую строку
+            if not df_unmatched.empty:
+                ws_unmatched = writer.sheets.get(unmatched_sheet_name)
+                if ws_unmatched is not None:
+                    ws_unmatched.freeze_panes = ws_unmatched["A2"]
+        except Exception:
+            pass
+
         if PatternFill is not None and "Процент совпадения" in df_result.columns:
             green_fill = PatternFill(fill_type="solid", start_color="C6EFCE", end_color="C6EFCE")
             # Данные начинаются со 2-й строки (1-я — заголовки)
