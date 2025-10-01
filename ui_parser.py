@@ -68,8 +68,15 @@ class ParserApp:
             messagebox.showerror("Ошибка", "Файл клиента не выбран"); return
         if not nom or not os.path.exists(nom):
             messagebox.showerror("Ошибка", "Файл номенклатуры не выбран"); return
+        # Если путь результата не указан – автогенерируем result+<порог>.xlsx в папке клиента
         if not out:
-            messagebox.showerror("Ошибка", "Укажите файл для результата"); return
+            try:
+                client_dir = os.path.dirname(os.path.abspath(client)) or os.getcwd()
+                out = os.path.join(client_dir, f"result+{score}.xlsx")
+                # Пишем в поле, чтобы пользователь видел итоговое имя
+                self.out_entry.insert(0, out)
+            except Exception:
+                messagebox.showerror("Ошибка", "Не удалось сформировать имя файла результата"); return
 
         threading.Thread(target=self.run_parse, args=(client, nom, out, score), daemon=True).start()
 

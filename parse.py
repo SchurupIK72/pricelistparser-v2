@@ -403,7 +403,10 @@ def main_process(
 
     client_path = client_path or "price_client.xlsx"
     nom_path = nom_path or "nomenclature.xlsx"
-    output_path = output_path or "result.xlsx"
+    user_provided_output = bool(output_path)
+    # Не присваиваем дефолт сразу, чтобы уметь сгенерировать динамическое имя
+    if not output_path:
+        output_path = None
 
     if not os.path.exists(client_path):
         raise FileNotFoundError(f"Файл клиента не найден: {client_path}")
@@ -412,7 +415,7 @@ def main_process(
 
     print(f"[INFO] Файл клиента: {client_path}")
     print(f"[INFO] Файл номенклатуры: {nom_path}")
-    print(f"[INFO] Файл результата: {output_path}")
+    # Лог пока отложим до генерации итогового пути
     print(f"[INFO] Порог совпадения: {min_score}")
 
     client_header = find_header_row(client_path)
@@ -950,6 +953,14 @@ def main_process(
 
     # Подготовим DataFrame непросопоставленных
     df_unmatched = pd.DataFrame(unmatched_rows)
+
+    # Если путь не был задан пользователем — формируем имя вида
+    # result+<заданный_порог>.xlsx (порог = min_score) в папке клиента
+    if not user_provided_output:
+        client_dir = os.path.dirname(os.path.abspath(client_path)) or os.getcwd()
+        dynamic_name = f"result+{min_score}.xlsx"
+        output_path = os.path.join(client_dir, dynamic_name)
+    print(f"[INFO] Файл результата: {output_path}")
 
     # Запишем в Excel и подсветим зеленым строки со 100% совпадением
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
