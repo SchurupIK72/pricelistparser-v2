@@ -1,5 +1,7 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
+from tkinter import ttk
+import time
 import threading
 import os
 import parse  # подключаем parse.py
@@ -40,7 +42,14 @@ class ParserApp:
         self.score_entry.grid(row=3, column=1, sticky="w", padx=4, pady=2)
 
         self.start_button = tk.Button(root, text="Запустить", command=self.start_process)
-        self.start_button.grid(row=4, column=0, columnspan=3, pady=10, padx=4, sticky="w")
+        self.start_button.grid(row=4, column=0, pady=10, padx=4, sticky="w")
+
+        # Прогресс-бар и метка времени
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress = ttk.Progressbar(root, variable=self.progress_var, maximum=100)
+        self.progress.grid(row=4, column=1, sticky="we", padx=4)
+        self.time_label = tk.Label(root, text="Время: 0.0 c")
+        self.time_label.grid(row=4, column=2, sticky="e", padx=4)
 
         self.log_text = tk.Text(root, height=12, width=entry_width + 20, state="disabled")
         self.log_text.grid(row=5, column=0, columnspan=3, sticky="nsew", padx=4, pady=4)
@@ -79,13 +88,43 @@ class ParserApp:
             except Exception:
                 messagebox.showerror("Ошибка", "Не удалось сформировать имя файла результата"); return
 
+        # Сбрасываем прогресс и запускаем поток
+        self.progress_var.set(0)
+        self._start_time = time.time()
+        self._last_update_ts = self._start_time
+        self._total_rows = 0
         threading.Thread(target=self.run_parse, args=(client, nom, out, score), daemon=True).start()
 
     def run_parse(self, client, nom, out, score):
         self.log("Запуск...\n")
+        def progress_cb(current, total):
+            # Инициализация total один раз
+            if self._total_rows == 0:
+                self._total_rows = total
+                # Перенастраиваем прогресс максимум
+                self.root.after(0, lambda: self.progress.configure(maximum=total))
+            # Обновление прогресса не чаще, чем каждые 50 мс чтобы не тормозить
+            now = time.time()
+            if now - getattr(self, '_last_update_ts', 0) >= 0.05 or current == total:
+                self._last_update_ts = now
+                elapsed = now - self._start_time
+                def ui_update():
+                    try:
+                        self.progress_var.set(current)
+                        self.time_label.config(text=f"Время: {elapsed:.1f} c")
+                    except Exception:
+                        pass
+                self.root.after(0, ui_update)
         try:
-            count = parse.main_process(client_path=client, nom_path=nom, output_path=out, min_score=score, interactive=False)
+            count = parse.main_process(client_path=client, nom_path=nom, output_path=out, min_score=score, interactive=False, progress_callback=progress_cb)
             self.log(f"✅ Готово! Найдено совпадений: {count}\nФайл: {out}\n")
+            elapsed_total = time.time() - self._start_time
+            self.log(f"Время выполнения: {elapsed_total:.2f} c\n")
+            # Установим прогресс на максимум (если досрочно)
+            try:
+                self.root.after(0, lambda: self.progress_var.set(self.progress['maximum']))
+            except Exception:
+                pass
             messagebox.showinfo("Успех", f"Результат сохранен в {out}")
         except Exception as e:
             self.log(f"❌ Ошибка: {e}\n")

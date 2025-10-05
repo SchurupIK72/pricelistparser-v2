@@ -371,6 +371,7 @@ def main_process(
     output_path: str = None,
     min_score: int = DEFAULT_MIN_MATCH_SCORE,
     interactive: bool = False,
+    progress_callback=None,  # callable(current:int, total:int)
 ):
     if interactive:
         print("=== Интерактивный режим ===")
@@ -597,6 +598,7 @@ def main_process(
             return 1
         return 0
 
+    total_rows = len(client_df)
     for line_idx, (_, row) in enumerate(client_df.iterrows(), start=1):
         # Множество уже добавленных артикулов номенклатуры для данной строки заказа (чтобы избежать дублей)
         emitted_articles_this_row = set()
@@ -972,6 +974,13 @@ def main_process(
                     val = ""
                 row_record[f'CLIENT::{col}'] = val
             unmatched_rows.append(row_record)
+
+        # Сообщаем о прогрессе после обработки строки
+        if progress_callback is not None:
+            try:
+                progress_callback(line_idx, total_rows)
+            except Exception:
+                pass
 
     # Сформируем результирующий DataFrame
     df_result = pd.DataFrame(results)
