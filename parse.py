@@ -808,7 +808,7 @@ def main_process(
                     if priority > chosen[4]:
                         chosen = (art, norm_art, best_row, best_score, priority)
 
-            # (дубликат старой логики удален)
+      
 
         matched = False
         if chosen is not None and chosen[3] >= min_score:
@@ -996,11 +996,10 @@ def main_process(
     df_unmatched = pd.DataFrame(unmatched_rows)
 
     # Если путь не был задан пользователем — формируем имя вида
-    # result+<заданный_порог>.xlsx (порог = min_score) в папке клиента
+    # result+<заданный_порог>+<имя_исходного_файла_без_расширения>.xlsx (порог = min_score) в папке клиента
     if not user_provided_output:
         client_dir = os.path.dirname(os.path.abspath(client_path)) or os.getcwd()
         client_base = os.path.splitext(os.path.basename(client_path))[0]
-        # Формат: result+<порог>+<имя_исходного_файла_без_расширения>.xlsx
         dynamic_name = f"result+{min_score}+{client_base}.xlsx"
         output_path = os.path.join(client_dir, dynamic_name)
     print(f"[INFO] Файл результата: {output_path}")
