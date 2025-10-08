@@ -3,7 +3,7 @@ from rapidfuzz import process, fuzz
 import re
 import os
 
-DEFAULT_MIN_MATCH_SCORE = 65  # минимальный процент совпадения по умолчанию
+DEFAULT_MIN_MATCH_SCORE = 95  # минимальный процент совпадения по умолчанию
 FILTER_NUMERIC_NOISE = True   # включить фильтрацию числового шума (цены, количества)
 AUTO_FIX_MOJIBAKE = True      # попытаться починить mojibake cp1251->latin1
 DIAG_COLLECT_UNMATCHED = True # собирать диагностическую информацию по непросопоставленным строкам
@@ -469,6 +469,30 @@ def main_process(
             return 1  # потом просто -СПЕЦМАШ
         return 2      # затем базовый
 
+    # Упрощённая функция для получения "структурной" базовой формы артикула БЕЗ сортировки токенов
+    # (оставляет порядок, чтобы отличать случаи ЦГ-80 vs ЦГ80 и затем можно их слить без штрафа)
+    SPEC_SUFFIX_TRIM_RE = re.compile(r"(?:-(?:СПЕЦМАШ|PRO-СПЕЦМАШ|РК|СБ|Р|В\d+))$", re.IGNORECASE)
+    SHORT_NUM_SUFFIX_RE = re.compile(r"-\d{1,3}[A-ZА-Я]?$")
+    def base_form_preserve(a: str) -> str:
+        if not isinstance(a, str):
+            return ""
+        s = a.upper()
+        hyphens = "\u2010\u2011\u2012\u2013\u2014\u2212"
+        trans = {ord(c): "-" for c in hyphens}
+        trans[0xA0] = " "
+        s = s.translate(trans).strip()
+        # убираем вариантный суффикс / служебные хвосты
+        s = re.sub(r"-(?:PRO-)?СПЕЦМАШ$", "", s)
+        s = re.sub(r"-(?:РК|СБ|Р|В\d+)$", "", s)
+        # короткие числовые (-10 / -01А) только если нет точек
+        if "." not in s:
+            while True:
+                new_s = SHORT_NUM_SUFFIX_RE.sub("", s)
+                if new_s == s:
+                    break
+                s = new_s
+        return s
+
     base_to_variants = {}
     for idx_v, a_v in enumerate(nomenclature_df["Артикул"].astype(str)):
         base_key = variant_base(a_v)
@@ -630,6 +654,23 @@ def main_process(
 
         extracted_all = list(token_origin.keys())
 
+        # Доп. расширение: если токен содержит '/', разбиваем и добавляем под-токены
+        # Например: "103/5440-3501132" -> "103" и "5440-3501132" (второй позволит дать 100% по базе 5440-3501132)
+        if extracted_all:
+            expanded = []
+            seen_expanded = set()
+            for tok in extracted_all:
+                expanded.append(tok)
+                seen_expanded.add(tok)
+                if '/' in tok:
+                    parts = [p.strip() for p in tok.split('/') if p.strip()]
+                    for p in parts:
+                        # Принимаем под-токен если длина >=3 и не добавлен ранее
+                        if len(p) >= 3 and p not in seen_expanded:
+                            expanded.append(p)
+                            seen_expanded.add(p)
+            extracted_all = expanded
+
         # Фильтрация очевидного числового шума: цены, количества, даты.
         if FILTER_NUMERIC_NOISE and extracted_all:
             filtered = []
@@ -770,6 +811,19 @@ def main_process(
                             priority = (q, 0, score, len(norm_art))
 
             if best_row is not None:
+                # Попытка повысить до 100% при структурно идентичной форме после удаления дефисов
+                if best_score < 100:
+                    try:
+                        bf_client = base_form_preserve(art)
+                        bf_nom = base_form_preserve(str(best_row.get("Артикул", "")))
+                        if bf_client and bf_nom and bf_client.replace("-", "") == bf_nom.replace("-", ""):
+                            # Структурно эквивалентны (разница только в дефисе между кратким буквенным префиксом и числом)
+                            best_score = 100
+                            # Повышаем tier до 3 (жёсткое совпадение)
+                            q = token_quality(art)
+                            priority = (q, 3, 100, len(norm_art))
+                    except Exception:
+                        pass
                 # Дополнительное ослабление при низкой релевантности названия: если совпадение 100% ("жёсткая" ветка)
                 # но текст строки не похож на название номенклатуры (например, артикул турбокомпрессора в строке про крыло),
                 # понижаем tier, чтобы другой кандидат мог победить.
