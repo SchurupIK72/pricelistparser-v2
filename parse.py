@@ -469,6 +469,20 @@ def main_process(
             return 1  # потом просто -СПЕЦМАШ
         return 2      # затем базовый
 
+    # Расширенный базовый корень для семейства числовых хвостов: обрезаем вариантный суффикс и финальный -NN или -NNN,
+    # чтобы объединить 5432.3708600-10-* и 5432.3708600-01-* в одно семейство.
+    NUM_TRAIL_RE = re.compile(r"-(\d{2,3})(?:-(?:PRO-)?СПЕЦМАШ)?$", re.IGNORECASE)
+    def numeric_family_root(a: str) -> str:
+        if not isinstance(a, str):
+            return ""
+        s = a.upper().strip()
+        # убираем вариантный суффикс временно для выделения хвоста
+        s_wo_var = re.sub(r"-(?:PRO-)?СПЕЦМАШ$", "", s)
+        m = NUM_TRAIL_RE.search(s_wo_var)
+        if m:
+            return s_wo_var[: m.start()]  # корень без финального -NN
+        return ""
+
     # Упрощённая функция для получения "структурной" базовой формы артикула БЕЗ сортировки токенов
     # (оставляет порядок, чтобы отличать случаи ЦГ-80 vs ЦГ80 и затем можно их слить без штрафа)
     SPEC_SUFFIX_TRIM_RE = re.compile(r"(?:-(?:СПЕЦМАШ|PRO-СПЕЦМАШ|РК|СБ|Р|В\d+))$", re.IGNORECASE)
@@ -497,6 +511,13 @@ def main_process(
     for idx_v, a_v in enumerate(nomenclature_df["Артикул"].astype(str)):
         base_key = variant_base(a_v)
         base_to_variants.setdefault(base_key, set()).add(idx_v)
+
+    # Дополнительная карта: числовой корень -> индексы (для расширения 5432.3708600-10-* -> включает -01-* и т.п.)
+    numeric_root_to_indices = {}
+    for idx_v, a_v in enumerate(nomenclature_df["Артикул"].astype(str)):
+        nroot = numeric_family_root(a_v)
+        if nroot:
+            numeric_root_to_indices.setdefault(nroot, set()).add(idx_v)
 
     nomenclature_df["Нормализованный артикул"] = nomenclature_df["Артикул"].apply(normalize_article)
     nomenclature_df["Базовое ядро"] = nomenclature_df["Артикул"].apply(get_article_core)
@@ -946,7 +967,12 @@ def main_process(
             if expand_variants:
                 original_score = best_score
                 base_key = variant_base(str(best_row["Артикул"]))
-                variant_indices = list(base_to_variants.get(base_key, {best_row.name}))
+                variant_indices_set = set(base_to_variants.get(base_key, {best_row.name}))
+                # Добавим братьев по числовому корню (например, -10-* и -01-*), если есть
+                num_root = numeric_family_root(str(best_row["Артикул"]))
+                if num_root and num_root in numeric_root_to_indices:
+                    variant_indices_set.update(numeric_root_to_indices[num_root])
+                variant_indices = list(variant_indices_set)
                 variant_indices.sort(key=lambda i: variant_rank(str(nomenclature_df.iloc[i]["Артикул"])))
                 for vidx in variant_indices:
                     vrow = nomenclature_df.iloc[vidx]
@@ -1148,10 +1174,19 @@ def main_process(
                 if ln not in multi_line_numbers:
                     continue
                 has_variant = any(isinstance(a, str) and a.upper().endswith(variant_suffixes) for a in arts)
-                if not has_variant:
+                # Дополнительно: если встречаются артикулы с общим числовым корнем (numeric_family_root), считаем их семьёй
+                numeric_roots = set()
+                for a in arts:
+                    if isinstance(a, str):
+                        try:
+                            nr = numeric_family_root(a)
+                            if nr:
+                                numeric_roots.add(nr)
+                        except Exception:
+                            pass
+                if not has_variant and not numeric_roots:
                     continue
                 family_lines_with_variants.add(ln)
-                # Собираем базовые ключи для всех артикулов в этой строке
                 base_keys = set()
                 for a in arts:
                     if isinstance(a, str):
@@ -1159,6 +1194,8 @@ def main_process(
                             base_keys.add(variant_base(a))
                         except Exception:
                             pass
+                # Сохраняем и числовые корни (добавляем как часть множества базовых ключей, чтобы окрасить базовые варианты разных окончаний)
+                base_keys.update(numeric_roots)
                 line_base_keys_with_variant[ln] = base_keys
             # Индексы нужных столбцов
             try:
@@ -1193,12 +1230,13 @@ def main_process(
                     if isinstance(art_match_val, str):
                         up = art_match_val.upper()
                         if up.endswith(variant_suffixes):
-                            make_dark = True  # сам вариант
+                            make_dark = True  # сам вариант суффикса
                         else:
-                            # Базовый артикул: красим если его базовый ключ совпадает с базовым ключом любого вариантного
                             try:
                                 base_key = variant_base(art_match_val)
-                                if base_key and base_key in line_base_keys_with_variant.get(line_number_val, set()):
+                                nr = numeric_family_root(art_match_val)
+                                candidate_keys = line_base_keys_with_variant.get(line_number_val, set())
+                                if (base_key and base_key in candidate_keys) or (nr and nr in candidate_keys):
                                     make_dark = True
                             except Exception:
                                 pass
