@@ -556,9 +556,25 @@ def main_process(
         if any(k in str(c).lower() for k in ["товар", "опис", "наимен", "назв"])
     ]
     quantity_cols = [
-        col
+        col 
         for col in client_df.columns
-        if any(k in str(col).lower() for k in ["кол-во", "количество", "qty", "шт", "заказ"])
+        if any(
+            k in str(col).lower()
+            for k in [
+                "кол-во",
+                "количество",
+                "колич",      # укороченный вариант
+                "колво",       # частая опечатка / слитное написание
+                "кол.",
+                " кол ",       # слово в окружении пробелов
+                " qty",
+                "qty",
+                "q-ty",
+                "quantity",
+                "шт",
+                "заказ",
+            ]
+        )
     ]
     price_cols = [
         col
@@ -627,9 +643,28 @@ def main_process(
         # Множество уже добавленных артикулов номенклатуры для данной строки заказа (чтобы избежать дублей)
         emitted_articles_this_row = set()
         unmatched_reason = None
+        # Раннее извлечение количества и цены: позже переиспользуем (не вычисляем многократно)
+        price_val_client = None
+        for pc in price_cols:
+            v = row.get(pc, None)
+            if pd.notna(v) and str(v).strip() != "":
+                price_val_client = v
+                break
+        qty_val = None
+        for qc in quantity_cols:
+            v = row.get(qc, None)
+            if pd.notna(v) and str(v).strip() != "":
+                qty_val = v
+                break
         raw_texts = []
         raw_texts_info = []  # (text, source_col_lower)
+        # При парсинге текстов исключаем чисто количественные столбцы, чтобы числа количества не попадали в токены
+        parse_source_cols = []
         for col in client_article_cols + description_cols:
+            if col in quantity_cols:
+                continue
+            parse_source_cols.append(col)
+        for col in parse_source_cols:
             val = row.get(col, "")
             val_clean = _clean_cell_value(val)
             if AUTO_FIX_MOJIBAKE:
@@ -740,6 +775,34 @@ def main_process(
                 if exact_idx is not None:
                     best_row, best_score = nomenclature_df.iloc[exact_idx], 100
                     priority = (q, 3, 100, len(norm_art))  # tier 3 highest now
+            # 1a) Попытка сопоставить после устранения лишней ведущей цифры в длинном числовом сегменте
+            # Сценарий: клиентский токен 11845-967325-3, в номенклатуре 1845-967325-3-СПЕЦМАШ
+            if best_row is None:
+                try:
+                    # Ищем числовые группы в исходном токене (НЕ нормализованном)
+                    for m in re.finditer(r"\d+", art):
+                        grp = m.group(0)
+                        if len(grp) >= 5 and grp.startswith('1'):
+                            contracted = grp[1:]  # отбрасываем ведущую '1'
+                            # Строим новую строку токена с заменой только этой группы
+                            mutated = art[:m.start()] + contracted + art[m.end():]
+                            norm_mut = normalize_article(mutated)
+                            # 1) Прямое совпадение по нормализованному
+                            exact_idx2 = norm_to_index.get(norm_mut)
+                            if exact_idx2 is not None:
+                                best_row, best_score = nomenclature_df.iloc[exact_idx2], 100
+                                priority = (q, 3, 100, len(norm_mut))
+                                break
+                            # 2) Совпадение по базовому ядру
+                            mut_core = get_article_core(mutated)
+                            if mut_core:
+                                base_idx2 = base_core_to_index.get(mut_core)
+                                if base_idx2 is not None:
+                                    best_row, best_score = nomenclature_df.iloc[base_idx2], 100
+                                    priority = (q, 3, 100, len(norm_mut))
+                                    break
+                except Exception:
+                    pass
             if best_row is None:
                 # 1b) Точное совпадение по базовому ядру (без вариантных суффиксов)
                 if client_core:
@@ -867,19 +930,6 @@ def main_process(
         matched = False
         if chosen is not None and chosen[3] >= min_score:
             art, norm_art, best_row, best_score, _ = chosen
-            # Цена и количество из заказа (первое найденное поле)
-            price_val_client = None
-            for pc in price_cols:
-                v = row.get(pc, None)
-                if pd.notna(v) and str(v).strip() != "":
-                    price_val_client = v
-                    break
-            qty_val = None
-            for qc in quantity_cols:
-                v = row.get(qc, None)
-                if pd.notna(v) and str(v).strip() != "":
-                    qty_val = v
-                    break
 
             # Строгое условие расширения вариантов: либо точные 100%, либо суффикс варианта с высоким скором и совпадением базового ядра
             art_name_upper = str(best_row["Артикул"]).upper()
@@ -956,19 +1006,7 @@ def main_process(
             if score >= min_score:
                 best_row = nomenclature_df.iloc[idx]
 
-                # Цена и количество из заказа (первое найденное поле)
-                price_val_client = None
-                for pc in price_cols:
-                    v = row.get(pc, None)
-                    if pd.notna(v) and str(v).strip() != "":
-                        price_val_client = v
-                        break
-                qty_val = None
-                for qc in quantity_cols:
-                    v = row.get(qc, None)
-                    if pd.notna(v) and str(v).strip() != "":
-                        qty_val = v
-                        break
+                # Цена и количество уже извлечены ранее (price_val_client, qty_val)
 
                 # Цена из номенклатуры приоритетнее
                 price_val_nom = best_row.get(nom_price_col, None) if nom_price_col else None
